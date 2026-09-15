@@ -2,14 +2,28 @@
 set -Eeuo pipefail
 PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
 [[ -n "$PROJECT_ID" && "$PROJECT_ID" != "(unset)" ]] || { echo "ERROR: gcloud project set nahi hai." >&2; exit 1; }
-# This challenge project rejects us-central1 by org policy. Override only if
-# your lab explicitly provides another allowed region: REGION=region ./01-cmek-v2.sh
-REGION="${REGION:-us-east4}"
+REGION="${REGION:-}"
+if [[ -z "$REGION" ]]; then
+  ZONE="$(gcloud compute instances describe bastion-vm --format='value(zone)' 2>/dev/null | awk -F/ '{print $NF}' || true)"
+  [[ -n "$ZONE" ]] && REGION="${ZONE%-*}"
+fi
+if [[ -z "$REGION" ]]; then
+  echo "Finding an allowed region from the lab project policy..."
+  PROBE="lab-probe-$RANDOM-$(date +%s)"
+  for candidate in us-east1 us-east4 us-central1 us-west1 us-west2 us-west3 us-west4 northamerica-northeast1 europe-west1 europe-west2 europe-west4 asia-east1 asia-southeast1; do
+    if gcloud kms keyrings create "$PROBE" --location="$candidate" --project="$PROJECT_ID" >/dev/null 2>&1; then
+      REGION="$candidate"
+      gcloud kms keyrings delete "$PROBE" --location="$REGION" --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+      break
+    fi
+  done
+fi
+[[ -n "$REGION" ]] || { echo "ERROR: no allowed region found." >&2; exit 1; }
 KEYRING="${KMS_KEYRING_ID:-cloud-sql-keyring}"
 KEY="${KMS_KEY_ID:-cloud-sql-key}"
 INSTANCE="${CLOUDSQL_INSTANCE:-postgres-orders}"
 ROOT_PASSWORD="${CLOUDSQL_ROOT_PASSWORD:-supersecret!}"
-echo "Project: $PROJECT_ID | Region: $REGION | Instance: $INSTANCE"
+echo "Project: $PROJECT_ID | Allowed region: $REGION | Instance: $INSTANCE"
 gcloud services enable sqladmin.googleapis.com cloudkms.googleapis.com --project="$PROJECT_ID"
 gcloud beta services identity create --service=sqladmin.googleapis.com --project="$PROJECT_ID" >/dev/null || true
 gcloud kms keyrings describe "$KEYRING" --location="$REGION" >/dev/null 2>&1 || gcloud kms keyrings create "$KEYRING" --location="$REGION"
