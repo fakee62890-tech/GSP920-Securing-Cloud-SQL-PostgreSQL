@@ -6,7 +6,12 @@ PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
 REGION="${REGION:-}"
 if [[ -z "$REGION" ]]; then
   ZONE="$(gcloud compute instances describe bastion-vm --format='value(zone)' 2>/dev/null | awk -F/ '{print $NF}' || true)"
-  if [[ -n "$ZONE" ]]; then REGION="${ZONE%-*}"; else REGION="us-central1"; fi
+  [[ -n "$ZONE" ]] && REGION="${ZONE%-*}"
+fi
+if [[ -z "$REGION" ]]; then
+  # If the lab has no bastion VM, use the usual GSP920 location. The script
+  # never uses us-central1 because many challenge projects deny that location.
+  REGION="us-east4"
 fi
 KEYRING="${KMS_KEYRING_ID:-cloud-sql-keyring}"
 KEY="${KMS_KEY_ID:-cloud-sql-key}"
@@ -17,32 +22,23 @@ echo "Project: $PROJECT_ID | Region: $REGION | Instance: $INSTANCE"
 gcloud services enable sqladmin.googleapis.com cloudkms.googleapis.com --project="$PROJECT_ID"
 gcloud beta services identity create --service=sqladmin.googleapis.com --project="$PROJECT_ID" >/dev/null || true
 
-gcloud kms keyrings describe "$KEYRING" --location="$REGION" >/dev/null 2>&1 || \
-  gcloud kms keyrings create "$KEYRING" --location="$REGION"
-gcloud kms keys describe "$KEY" --keyring="$KEYRING" --location="$REGION" >/dev/null 2>&1 || \
-  gcloud kms keys create "$KEY" --location="$REGION" --keyring="$KEYRING" --purpose=encryption
-
+gcloud kms keyrings describe "$KEYRING" --location="$REGION" >/dev/null 2>&1 || gcloud kms keyrings create "$KEYRING" --location="$REGION"
+gcloud kms keys describe "$KEY" --keyring="$KEYRING" --location="$REGION" >/dev/null 2>&1 || gcloud kms keys create "$KEY" --location="$REGION" --keyring="$KEYRING" --purpose=encryption
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
-gcloud kms keys add-iam-policy-binding "$KEY" --location="$REGION" --keyring="$KEYRING" \
-  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-cloud-sql.iam.gserviceaccount.com" \
-  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter --quiet >/dev/null
-
+gcloud kms keys add-iam-policy-binding "$KEY" --location="$REGION" --keyring="$KEYRING" --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-cloud-sql.iam.gserviceaccount.com" --role=roles/cloudkms.cryptoKeyEncrypterDecrypter --quiet >/dev/null
 KEY_NAME="$(gcloud kms keys describe "$KEY" --keyring="$KEYRING" --location="$REGION" --format='value(name)')"
-AUTHORIZED_IP="$(gcloud compute instances describe bastion-vm --zone="$(gcloud compute instances describe bastion-vm --format='value(zone)' | awk -F/ '{print $NF}')" --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null || true)"
+AUTHORIZED_IP=""
+BASTION_ZONE="$(gcloud compute instances describe bastion-vm --format='value(zone)' 2>/dev/null | awk -F/ '{print $NF}' || true)"
+if [[ -n "$BASTION_ZONE" ]]; then AUTHORIZED_IP="$(gcloud compute instances describe bastion-vm --zone="$BASTION_ZONE" --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null || true)"; fi
 CLOUD_SHELL_IP="$(curl -fsS https://ifconfig.me || true)"
 NETWORKS=""
 [[ -n "$AUTHORIZED_IP" ]] && NETWORKS="${AUTHORIZED_IP}/32"
 [[ -n "$CLOUD_SHELL_IP" ]] && NETWORKS="${NETWORKS:+$NETWORKS,}${CLOUD_SHELL_IP}/32"
-
+[[ -n "$NETWORKS" ]] || { echo "ERROR: authorized network IP nahi mili." >&2; exit 1; }
 if gcloud sql instances describe "$INSTANCE" --project="$PROJECT_ID" >/dev/null 2>&1; then
   echo "Cloud SQL instance already exists; create step skipped."
 else
-  [[ -n "$NETWORKS" ]] || { echo "ERROR: authorized network IPs nahi milin." >&2; exit 1; }
-  gcloud sql instances create "$INSTANCE" --project="$PROJECT_ID" \
-    --authorized-networks="$NETWORKS" --disk-encryption-key="$KEY_NAME" \
-    --database-version=POSTGRES_14 --cpu=1 --memory=3840MB --region="$REGION" \
-    --root-password="$ROOT_PASSWORD" --quiet
+  gcloud sql instances create "$INSTANCE" --project="$PROJECT_ID" --authorized-networks="$NETWORKS" --disk-encryption-key="$KEY_NAME" --database-version=POSTGRES_14 --cpu=1 --memory=3840MB --region="$REGION" --root-password="$ROOT_PASSWORD" --quiet
 fi
-
 echo "DONE: CMEK-enabled Cloud SQL instance ready: $INSTANCE"
-echo "Run next: gsp920-02-pgaudit.sh"
+echo "Run next: 02-pgaudit.sh"
